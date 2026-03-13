@@ -9,8 +9,11 @@
 #include <cstdint>
 #include <array>
 #include <cstring>
+#include <unistd.h>
 
 ////////////////////////////////////////////////////////////////////////////////
+
+static constexpr char8_t SYMBOLS[] = u8"│─╭╮╰╯"; 
 
 // Thanks cross-platform compat...
 // (thanks ProjectPhysX)
@@ -42,27 +45,53 @@ void get_terminal_size(int &width, int &height)
 consteval std::array<uint8_t,256 * 3> make_hue_LUT()
 {
 	std::array<uint8_t,256 * 3> lut;
-	uint8_t *r = lut.begin(),
-	        *g = r + 1,
-	        *b = r + 2;
 
 	for (uint_fast16_t i = 0; i < 256; i++) {
+		size_t idx = i * 3;
 	    uint8_t sector = i / 43;
 		uint8_t offset = i - sector * 43;
 
 		uint8_t t = ((uint16_t)offset * 255 + 21) / 43;
 
 		switch (sector)	{
-			case 0: *r = 255;     *g = t;       *b = 0;       break;
-			case 1: *r = 255 - t; *g = 255;     *b = 0;       break;
-			case 2: *r = 0;       *g = 255;     *b = t;       break;
-			case 3: *r = 0;       *g = 255 - t; *b = 255;     break;
-			case 4: *r = t;       *g = 0;       *b = 255;     break;
-			default:*r = 255;     *g = 0;       *b = 255 - t; break;
+			case 0:  lut[idx]=255;  lut[idx+1]=t;    lut[idx+2]=0; break;
+			case 1:  lut[idx]=255-t;lut[idx+1]=255;  lut[idx+2]=0; break;
+			case 2:  lut[idx]=0;    lut[idx+1]=255;  lut[idx+2]=t; break;
+			case 3:  lut[idx]=0;    lut[idx+1]=255-t;lut[idx+2]=255; break;
+			case 4:  lut[idx]=t;    lut[idx+1]=0;    lut[idx+2]=255; break;
+			default: lut[idx]=255;  lut[idx+1]=0;    lut[idx+2]=255-t; break;
 		}
-
-		r+=3, g+=3, b+=3;
 	}
+	return lut;
+}
+
+consteval std::size_t digits10(size_t v)
+{
+	std::size_t d = 1;
+	while (v >= 10) {
+		v /= 10;
+		++d;
+	}
+	return d;
+}
+
+template <size_t MAX>
+consteval auto make_num_to_char_lut()
+{
+	constexpr std::size_t DIGITS = digits10(MAX);
+
+	std::array<char[DIGITS], MAX + 1> lut{};
+
+	for (std::size_t i = 0; i <= MAX; ++i) {
+		std::size_t v = i;
+
+		for (std::size_t d = 0; d < DIGITS; ++d) {
+			auto idx = DIGITS - 1 - d;
+			lut[i][idx] = char('0' + (v % 10));
+			v /= 10;
+		}
+	}
+
 	return lut;
 }
 
@@ -102,59 +131,32 @@ inline int print_at_rgb(int w, int h, const char rgb[3], const char *fmt, ...)
 	return r;
 }*/
 
-static constexpr char NUM_TO_CHAR_LUT[256][4] = {
-	"000","001","002","003","004","005","006","007","008","009",
-	"010","011","012","013","014","015","016","017","018","019",
-	"020","021","022","023","024","025","026","027","028","029",
-	"030","031","032","033","034","035","036","037","038","039",
-	"040","041","042","043","044","045","046","047","048","049",
-	"050","051","052","053","054","055","056","057","058","059",
-	"060","061","062","063","064","065","066","067","068","069",
-	"070","071","072","073","074","075","076","077","078","079",
-	"080","081","082","083","084","085","086","087","088","089",
-	"090","091","092","093","094","095","096","097","098","099",
-	"100","101","102","103","104","105","106","107","108","109",
-	"110","111","112","113","114","115","116","117","118","119",
-	"120","121","122","123","124","125","126","127","128","129",
-	"130","131","132","133","134","135","136","137","138","139",
-	"140","141","142","143","144","145","146","147","148","149",
-	"150","151","152","153","154","155","156","157","158","159",
-	"160","161","162","163","164","165","166","167","168","169",
-	"170","171","172","173","174","175","176","177","178","179",
-	"180","181","182","183","184","185","186","187","188","189",
-	"190","191","192","193","194","195","196","197","198","199",
-	"200","201","202","203","204","205","206","207","208","209",
-	"210","211","212","213","214","215","216","217","218","219",
-	"220","221","222","223","224","225","226","227","228","229",
-	"230","231","232","233","234","235","236","237","238","239",
-	"240","241","242","243","244","245","246","247","248","249",
-	"250","251","252","253","254","255"
-};
+static constexpr auto NUM_TO_CHAR_LUT_3 = make_num_to_char_lut<999>();
+static constexpr auto NUM_TO_CHAR_LUT_4 = make_num_to_char_lut<9999>();
 
 inline void print_char_at_rgb(
-	int x,
-	int y,
+	uint16_t x,
+	uint16_t y,
 	const unsigned char rgb[3],
-	char c)
+	const char c[4])
 {
-	static char buf_template[31] = "\033[000;000H\033[38;2;000;000;000m ";
-	char buf[31]; // for cursor + RGB + char + \0
-	memcpy(buf, buf_template, 31);
+	char buf[35] = "\033[000;0000H\033[38;2;000;000;000m \0\0\0";
+		// for cursor + RGB + char (utf8 so 4bytes) + \0
 
     // Overwrite the coordinates (y at 3..5, x at 7..9)
-    memcpy(buf + 3, NUM_TO_CHAR_LUT[y], 3);
-    memcpy(buf + 7, NUM_TO_CHAR_LUT[x], 3);
+    memcpy(buf + 2, NUM_TO_CHAR_LUT_3[y], 3);
+    memcpy(buf + 6, NUM_TO_CHAR_LUT_4[x], 4);
 
     // Overwrite RGB (r at 17..19, g at 21..23, b at 25..27)
-    memcpy(buf + 17, NUM_TO_CHAR_LUT[rgb[0]], 3);
-    memcpy(buf + 21, NUM_TO_CHAR_LUT[rgb[1]], 3);
-    memcpy(buf + 25, NUM_TO_CHAR_LUT[rgb[2]], 3);
+    memcpy(buf + 18, NUM_TO_CHAR_LUT_3[rgb[0]], 3);
+    memcpy(buf + 22, NUM_TO_CHAR_LUT_3[rgb[1]], 3);
+    memcpy(buf + 26, NUM_TO_CHAR_LUT_3[rgb[2]], 3);
 
 	// Character
-	buf[29] = c;
+    memcpy(buf + 30, c, 3);
 
 	// Write all at once
-	write(1, buf, 31);
+	write(1, buf, 35);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -164,15 +166,16 @@ class Pipe
 public:
 	inline static unsigned idIncr = 0;
 	unsigned id;
-	int headX = 0;
-	int headY = 0;
+	uint16_t headX = 0;
+	uint16_t headY = 0;
 	uint8_t direction; // 0 north, 1 east, 2 south, 3 west
 	uint8_t rgb[3] = {0};
 	int *termWidth;
 	int *termHeight;
-	static constexpr uint8_t rotProba = 2; // out of 16
+	static constexpr uint8_t rotProba = 20; // out of 128
+	// Value is adjusted later
 
-	int pipe_pos[116*2] = {0}; // Stores XY for each pipe already drawn.
+	uint16_t pipe_pos[116*2] = {0}; // Stores XY for each pipe already drawn.
 	// 116 is the number of shades of the color (starting from 255) that i
 	// will get if i fo x * 250 / 255 after each frame
 	// so at frame 117 the first pixel will be black
@@ -180,43 +183,58 @@ public:
 
 	Pipe(int *w, int *h) :
 		id(idIncr++),
+		headX(rand() % *w), headY(rand() % *h),
 		direction(rand() & 0b11),
 		termWidth(w), termHeight(h)
 	{
-		const uint8_t *val = HUE_LUT.data() + rand()%255 * 3;
+		const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF)* 3;
 		rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
 	}
 
 	void move()
 	{
+		// The logic is around 4 tasks:
+		// - select the correct symbol to print
+		// - change the direction randomly
+		// - go in this direction
+		// - append the char pos to the list so it can be modified later
+		char8_t symb = u8'+';
+		symb = SYMBOLS[direction&1];
+
+		// Change direction
+		// If the movement is horizontal, the chances to change dir are divided
+		// by 2 because the format of a monospace char is 2:1
+		uint8_t randN = rand() & 0xFF;
+		// If direction is odd the mov is horizontal
+		// so we multiply rot proba by 2
+		uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
+		if (randN <= compProb) {
+			++direction &= 0b11;
+		} else if (randN >= 0xFF - compProb) {
+			(direction += 3) &= 0b11;
+		}
+
 		// For each dir, + of - in the correct direction
 		// then % to stay in the terminal
 		switch (direction) {
 		case 0: // North
-			--headY %= *termHeight;
+			(headY += *termHeight-1) %= *termHeight;
 			break;
 		case 2: // South
 			++headY %= *termHeight;
 			break;
 		case 3: // West
-			--headX %= *termWidth;
+			(headX += *termWidth-1) %= *termWidth;
 			break;
 		case 1: // East
 			++headX %= *termWidth;
 			break;
-		
 		default:
+			fprintf(stderr, "Direction error");
 			break;
 		}
 
-		print_char_at_rgb(headX, headY, rgb, '+');
-
-		// Change direction
-		unsigned char randN = rand() & 0xF;
-		if (randN <= rotProba)
-			++direction &= 0xF;
-		else if (randN >= 10 - rotProba)
-			--direction &= 0xF;
+		print_char_at_rgb(headX, headY, rgb, symb);
 	}
 };
 
@@ -231,10 +249,17 @@ public:
 	Pipes()
 	{
 		get_terminal_size(terminalWidth, terminalHeight);
+		pipes.emplace_back(Pipe(&terminalWidth, &terminalHeight));
+		pipes.emplace_back(Pipe(&terminalWidth, &terminalHeight));
+		pipes.emplace_back(Pipe(&terminalWidth, &terminalHeight));
+		pipes.emplace_back(Pipe(&terminalWidth, &terminalHeight));
 	}
 	// Next frame
 	void next_frame()
-	{}
+	{
+		for (auto &pipe : pipes)
+			pipe.move();
+	}
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -248,6 +273,9 @@ int main()
     constexpr auto frame_time = std::chrono::milliseconds(50); // 20 FPS
 
 	auto next = clock::now();
+
+	// Set bold
+	write(1, "\e[1m", 4);
 
 	while (true) {
 		next += frame_time;
