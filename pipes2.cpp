@@ -13,7 +13,7 @@
 
 ////////////////////////////////////////////////////////////////////////////////
 
-static constexpr char8_t SYMBOLS[] = u8"│─╭╮╰╯"; 
+static constexpr char SYMBOLS[3*6+1] = "│─╭╮╰╯"; // UTF8: 3 bytes each + \0
 
 // Thanks cross-platform compat...
 // (thanks ProjectPhysX)
@@ -187,7 +187,7 @@ public:
 		direction(rand() & 0b11),
 		termWidth(w), termHeight(h)
 	{
-		const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF)* 3;
+		const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF) * 3;
 		rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
 	}
 
@@ -198,8 +198,8 @@ public:
 		// - change the direction randomly
 		// - go in this direction
 		// - append the char pos to the list so it can be modified later
-		char8_t symb = u8'+';
-		symb = SYMBOLS[direction&1];
+
+		char symb[4] = "+";
 
 		// Change direction
 		// If the movement is horizontal, the chances to change dir are divided
@@ -208,11 +208,47 @@ public:
 		// If direction is odd the mov is horizontal
 		// so we multiply rot proba by 2
 		uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
-		if (randN <= compProb) {
+		if (randN <= compProb) { // direction move CW
+			static constexpr uint8_t DIR_LUT[] = {6, 9, 15, 12};
+			memcpy(symb, &SYMBOLS[DIR_LUT[direction]], 3);
+			/* Same as
+			switch (direction) {
+			case 0: // South -> East
+				memcpy(symb, &SYMBOLS[2*3], 3); break;
+			case 1: // West -> South
+				memcpy(symb, &SYMBOLS[3*3], 3); break;
+			case 2: // North -> West
+				memcpy(symb, &SYMBOLS[5*3], 3); break;
+			case 3: // East -> North
+				memcpy(symb, &SYMBOLS[4*3], 3); break;
+			default:
+				fprintf(stderr, "Direction error");
+				break;
+			}*/
 			++direction &= 0b11;
-		} else if (randN >= 0xFF - compProb) {
+		} else if (randN >= 0xFF - compProb) { // direction move CCW
+			static constexpr uint8_t DIR_LUT[] = {9, 15, 12, 6};
+			memcpy(symb, &SYMBOLS[DIR_LUT[direction]], 3);
+			/* Same as
+			switch (direction) {
+			case 0: // South -> West
+				memcpy(symb, &SYMBOLS[3*3], 3); break;
+			case 1: // West -> North
+				memcpy(symb, &SYMBOLS[5*3], 3); break;
+			case 2: // North -> East
+				memcpy(symb, &SYMBOLS[4*3], 3); break;
+			case 3: // East -> South
+				memcpy(symb, &SYMBOLS[2*3], 3); break;
+			default:
+				fprintf(stderr, "Direction error");
+				break;
+			}*/
 			(direction += 3) &= 0b11;
+		} else {
+			memcpy(symb, &SYMBOLS[3*(direction&1)], 3);
 		}
+
+		print_char_at_rgb(headX, headY, rgb, symb);
 
 		// For each dir, + of - in the correct direction
 		// then % to stay in the terminal
@@ -233,8 +269,6 @@ public:
 			fprintf(stderr, "Direction error");
 			break;
 		}
-
-		print_char_at_rgb(headX, headY, rgb, symb);
 	}
 };
 
