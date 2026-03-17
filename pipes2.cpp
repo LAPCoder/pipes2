@@ -1,4 +1,5 @@
 // g++ pipes2.cpp -o pipes2 -Wall -Wextra -fuse-ld=lld -Wshadow -g -fsanitize=address,undefined -O3 -std=c++20
+// I should put an intro
 
 #include <chrono>
 #include <thread>
@@ -11,20 +12,40 @@
 #include <cstring>
 #include <unistd.h>
 #include <cassert>
+#include <cmath>
 
-#define DO_SHADES
-#define DEBUG
-#define SHADES 116
-#define PIPES_COUNT 32
-#define FRAME_BUFFER 131072 // Should me more than 34*PIPES_COUNT*SHADES
-                            // 34 being the buffer of print_char_at_rgb
+#define SHADES 116 // Change this if you change the multiplier for the shading
+#ifdef DO_SHADES
+#	define DO_BOUNCE // (comment to disable)
+#endif
+#define DEBUG // (comment to disable)
+// You might want to use with this option:
+// errout=$(mktemp) && ./pipes2 2> $errout ; printf "\033[H\033[0m" ; cat $errout
+
+#define PIPE_PER_CHUNK 147 // One chunk is 64*64
+                           // (chunk means nothing in the logic)
+#define MAX_TERM_WIDTH 1000 // If you change this you will need to change
+                            // the LUT and the wirte function
 #define MEMCPY __builtin_memcpy // You can use memcpy if you have bugs
+#define MEMSET __builtin_memset //             memset
 
 ////////////////////////////////////////////////////////////////////////////////
 
+class Pipes;
+class Pipe;
+
+void get_terminal_size(int &, int &);
+std::array<uint8_t, 3> query_term_bg();
+consteval std::array<uint8_t,256 * 3> make_hue_LUT();
+consteval std::size_t digits10(size_t);
+template <size_t MAX> consteval auto make_num_to_char_lut();
+consteval std::array<uint8_t, SHADES> make_decay_lut();
+
 static constexpr char SYMBOLS[3*6+1] = "│─╭╮╰╯"; // UTF8: 3 bytes each + \0
-char framebuf[FRAME_BUFFER];
-unsigned framebufLen = 0;
+// Each NEEDS to be 3 byte each otherwise the print function will break.
+// Add \0 if you need
+
+////////////////////////////////////////////////////////////////////////////////
 
 // Thanks cross-platform compat...
 // (thanks ProjectPhysX)
@@ -129,23 +150,6 @@ std::array<uint8_t, 3> query_term_bg()
 	return { uint8_t(r >> sh), uint8_t(g >> sh), uint8_t(b >> sh) };
 }
 
-inline ssize_t flush_buf()
-{
-	ssize_t r = write(1, framebuf, framebufLen);
-	framebufLen = 0;
-	return r;
-}
-
-// Append to the buffer
-// Note: Caller must ensure n < FRAME_BUFFER or this will overflow
-inline void write_to_buf(const char *buf, size_t n)
-{
-	if (n + framebufLen >= FRAME_BUFFER) [[unlikely]]
-		flush_buf();
-	MEMCPY(framebuf + framebufLen, buf, n);
-	framebufLen += n;
-}
-
 // Converts HSV hue (brightness and value are 255) to RGB color
 // You need to use r=LUT[3*i+0] g=LUT[3*i+1] b=[3*i+2]
 consteval std::array<uint8_t,256 * 3> make_hue_LUT()
@@ -201,11 +205,8 @@ consteval auto make_num_to_char_lut()
 	return lut;
 }
 
-// L1 cache alignment (64-byte cache line) for hot lookup tables
-alignas(64) static constexpr std::array<uint8_t,256 * 3> HUE_LUT =
-	make_hue_LUT();
-
 // Precompute decay factors: (250/255)^i for each shade
+// Change SHADES if you change the factor
 consteval std::array<uint8_t, SHADES> make_decay_lut()
 {
 	std::array<uint8_t, SHADES> lut;
@@ -217,203 +218,69 @@ consteval std::array<uint8_t, SHADES> make_decay_lut()
 	return lut;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+
+// L1 cache alignment (64-byte cache line) for hot lookup tables
+alignas(64) static constexpr std::array<uint8_t,256*3> HUE_LUT = make_hue_LUT();
 alignas(64) static constexpr auto DECAY_LUT = make_decay_lut();
-
-alignas(64) static constexpr auto NUM_TO_CHAR_LUT_3 =
-	make_num_to_char_lut<999>();
-//alignas(64) static constexpr auto NUM_TO_CHAR_LUT_4 =
-//	make_num_to_char_lut<9999>();
-
-inline void print_char_at_rgb(
-	uint16_t x,
-	uint16_t y,
-	const unsigned char rgb[3],
-	const char c[4])
-{
-	//char buf[35] = "\033[000;0000H\033[38;2;000;000;000m \0\0\0";
-	char buf[34] = "\033[000;000H\033[38;2;000;000;000m \0\0\0";
-		// for cursor + RGB + char (utf8 so 4bytes) + \0
-
-    // Overwrite the coordinates (y at 3..5, x at 7..9)
-    MEMCPY(buf + 2, NUM_TO_CHAR_LUT_3[y], 3);
-    MEMCPY(buf + 6, NUM_TO_CHAR_LUT_3[x], 3);
-
-    // Overwrite RGB (r at 17..19, g at 21..23, b at 25..27)
-    MEMCPY(buf + 17, NUM_TO_CHAR_LUT_3[rgb[0]], 3);
-    MEMCPY(buf + 21, NUM_TO_CHAR_LUT_3[rgb[1]], 3);
-    MEMCPY(buf + 25, NUM_TO_CHAR_LUT_3[rgb[2]], 3);
-
-	// Character
-    MEMCPY(buf + 29, c, 3);
-
-	// Write all at once
-	write_to_buf(buf, 34);
-}
+alignas(64) static constexpr auto NUM_TO_CHAR_LUT_3 = make_num_to_char_lut<999>();
+//alignas(64) static constexpr auto NUM_TO_CHAR_LUT_4 = make_num_to_char_lut<9999>();
 
 ////////////////////////////////////////////////////////////////////////////////
 
 class Pipe
 {
 public:
-	//inline static unsigned idIncr = 0;
-	//unsigned id;
+	Pipes *parent;
 	uint16_t headX = 0;
 	uint16_t headY = 0;
 	uint8_t direction; // 0 north, 1 east, 2 south, 3 west
 	uint8_t rgb[3] = {0};
-	std::array<uint8_t, 3> bgRgb;
-	int *termWidth;
-	int *termHeight;
 	static constexpr uint8_t rotProba = 20; // out of 128
 	// Value is adjusted later
 
-	#ifdef DO_SHADES
 	uint16_t pipePos[SHADES*2] = {0}; // Stores XY for each pipe already drawn.
 	// 116 is the number of shades of the color (starting from 255) that i
 	// will get if i fo x * 250 / 255 after each frame
 	// so at frame 117 the first pixel will be black
 	uint8_t charId[SHADES] = {0};
 	uint_fast8_t index = 0; // Index of the last pixel drawn
-	#endif
 
-	Pipe(int *w, int *h, std::array<uint8_t, 3> &bg) :
-	//	id(idIncr++),
-		headX(rand() % *w), headY(rand() % *h),
-		direction(rand() & 0b11),
-		bgRgb(bg),
-		termWidth(w), termHeight(h)
-	{
-		const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF) * 3;
-		rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
-	}
-
-	void move()
-	{
-		// The logic is around 4 tasks:
-		// - select the correct symbol to print
-		// - change the direction randomly
-		// - go in this direction
-		// - append the char pos to the list so it can be modified later
-
-		char symb[4] = "+";
-
-		// Change direction
-		// If the movement is horizontal, the chances to change dir are divided
-		// by 2 because the format of a monospace char is 2:1
-		uint8_t randN = rand() & 0xFF;
-		// If direction is odd the mov is horizontal
-		// so we multiply rot proba by 2
-		uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
-		if (randN <= compProb) { // direction move CW
-			static constexpr uint8_t DIR_LUT[] = {6, 9, 15, 12};
-			MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
-			/* Same as
-			switch (direction) {
-			case 0: // South -> East
-				memcpy(symb, &SYMBOLS[charId[index] = 2*3], 3); break;
-			case 1: // West -> South
-				memcpy(symb, &SYMBOLS[charId[index] = 3*3], 3); break;
-			case 2: // North -> West
-				memcpy(symb, &SYMBOLS[charId[index] = 5*3], 3); break;
-			case 3: // East -> North
-				memcpy(symb, &SYMBOLS[charId[index] = 4*3], 3); break;
-			default:
-				fprintf(stderr, "Direction error");
-				break;
-			}*/
-			++direction &= 0b11;
-		} else if (randN >= 0xFF - compProb) { // direction move CCW
-			static constexpr uint8_t DIR_LUT[] = {9, 15, 12, 6};
-			MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
-			/* Same as
-			switch (direction) {
-			case 0: // South -> West
-				memcpy(symb, &SYMBOLS[charId[index] = 3*3], 3); break;
-			case 1: // West -> North
-				memcpy(symb, &SYMBOLS[charId[index] = 5*3], 3); break;
-			case 2: // North -> East
-				memcpy(symb, &SYMBOLS[charId[index] = 4*3], 3); break;
-			case 3: // East -> South
-				memcpy(symb, &SYMBOLS[charId[index] = 2*3], 3); break;
-			default:
-				fprintf(stderr, "Direction error");
-				break;
-			}*/
-			(direction += 3) &= 0b11;
-		} else {
-			MEMCPY(symb, &SYMBOLS[charId[index] = 3*(direction&1)], 3);
-		}
-
-		#ifdef DO_SHADES
-			pipePos[index * 2] = headX;
-			pipePos[index * 2 + 1] = headY;
-			index = (index + 1) % SHADES;
-		#else
-			print_char_at_rgb(headX, headY, rgb, symb);
-		#endif
-
-		// For each dir, + of - in the correct direction
-		// then % to stay in the terminal
-		switch (direction) {
-		case 0: // North
-			(headY += *termHeight-1) %= *termHeight;
-			break;
-		case 2: // South
-			++headY %= *termHeight;
-			break;
-		case 3: // West
-			(headX += *termWidth-1) %= *termWidth;
-			break;
-		case 1: // East
-			++headX %= *termWidth;
-			break;
-		default: [[unlikely]]
-			fprintf(stderr, "Direction error");
-			break;
-		}
-	}
-
-	// Local index because its the priority:
-	// lowers (first drawn/oldest) to higher (last drawn/newest)
-	// localIndex=0: oldest, localIndex=SHADES-1: newest
-	void reprint(uint_fast8_t localIndex)
-	{
-		uint_fast8_t idx = (index + localIndex) % SHADES;
-		// localIndex directly indexes decay table
-		uint8_t decay = DECAY_LUT[localIndex];
-		uint8_t invDecay = 255 - decay;
-		uint8_t newRgb[3] = {
-			(uint8_t)(((rgb[0]*decay) >> 8) + ((bgRgb[0]*invDecay) >> 8)),
-			(uint8_t)(((rgb[1]*decay) >> 8) + ((bgRgb[1]*invDecay) >> 8)),
-			(uint8_t)(((rgb[2]*decay) >> 8) + ((bgRgb[2]*invDecay) >> 8))
-		};
-		uint16_t posX = pipePos[idx * 2];
-		if (!posX) return;
-		print_char_at_rgb(
-			posX,
-			pipePos[idx * 2 + 1],
-			newRgb,
-			&SYMBOLS[charId[idx]]);
-	}
+	Pipe(Pipes *p);
+	void move();
+	void reprint(uint_fast8_t localIndex);
 };
 
 class Pipes
 {
 private:
 	std::vector<Pipe> pipes;
-	std::array<uint8_t, 3> backgroundRgb;
+	unsigned density = 4;
 public:
 	int terminalHeight = 0;
 	int terminalWidth = 0;
+	std::array<uint8_t, 3> bgRgb;
+	size_t BUFFER_SIZE = 0;
+	uint8_t (*framebuf)[2][3] = nullptr; // [terminalWidth*y+x][set1/2][utf8 or r/g/b]
 
-	Pipes(std::array<uint8_t, 3> bgRgb = {0}):
-		backgroundRgb(bgRgb)
+	Pipes(std::array<uint8_t, 3> bg = {0}):
+		bgRgb(bg)
 	{
 		get_terminal_size(terminalWidth, terminalHeight);
+		BUFFER_SIZE = terminalHeight * terminalWidth;
+		// Controls the density of pipes drawn (depends on the size of the screen)
+		// Change the divider  to match your preferences
+		density = std::max(BUFFER_SIZE / PIPE_PER_CHUNK,(size_t)4);
+
+		framebuf = new uint8_t[BUFFER_SIZE][2][3]{0};
 		
-		for (uint_fast16_t i = 0; i < PIPES_COUNT; i++)
-			pipes.emplace_back(
-				Pipe(&terminalWidth, &terminalHeight, backgroundRgb));
+		for (unsigned i = 0; i < density; i++)
+			pipes.emplace_back(Pipe(this));
+	}
+
+	~Pipes()
+	{
+		delete framebuf;
 	}
 
 	// Next frame
@@ -421,13 +288,182 @@ public:
 	{
 		for (auto &pipe : pipes)
 			pipe.move();
-		#ifdef DO_SHADES
 		for (uint_fast8_t i = 0; i < SHADES; i++)
 			for (auto &pipe : pipes)
 				pipe.reprint(i);
-		#endif
+	}
+
+	// Append to the buffer
+	inline void write_to_buf(
+		const uint8_t rgb[3],
+		const char utf8[3],
+		const uint16_t x,
+		const uint16_t y)
+	{
+		size_t pos = y * terminalWidth + x;
+		if (pos >= BUFFER_SIZE) [[unlikely]]
+		{
+			#ifdef DEBUG
+			fprintf(stderr, "Error: bad buffer pos (overflow)\n");
+			#endif
+			return;
+		}
+		MEMCPY(framebuf[pos][0], rgb, 3);
+		MEMCPY(framebuf[pos][1], utf8, 3);
+	}
+
+	// Write the buffer to the terminal
+	inline void flush_buf()
+	{
+		// Each char is a color ESC code "\033[38;2;000;000;000m" 
+		// + the actual UTF-8 char (3 byte) so 19 + 3 = 22 bytes per char
+		// + the "\033[000;0H" (8 byte) to move to the correct pos
+		const size_t lineLen = terminalWidth*22 + 8;
+		static char line[MAX_TERM_WIDTH*22 + 8];
+		static constexpr char MV[9] = "\033[000;0H"; // 8+\0 but we dont need \0
+		static constexpr char COLOR[20] = "\033[38;2;000;000;000m"; // 19+\0
+		static constexpr char SKIP[7] = "\033[000C"; // 6+\0
+		for (uint_fast16_t y = 0; y < (uint_fast16_t)terminalHeight; y++)
+		{
+			size_t lenLineAct = lineLen;
+			// Reset line
+			MEMSET(line, 0, lineLen);
+			// Init line
+			MEMCPY(line, MV, 8);
+			MEMCPY(line + 2, NUM_TO_CHAR_LUT_3[y+1], 3);
+			char *start = line+8;
+			uint16_t nCellsSkipped = 0;
+			for (uint_fast16_t x = 0; x < (uint_fast16_t)terminalWidth; x++)
+			{
+				uint8_t (*cell)[3] = framebuf[y*terminalWidth+x];
+				// Check if RGB is black + char is null
+				if (!(cell[0][0] || cell[0][1] || cell[0][2] || cell[1][0])) {
+					nCellsSkipped++;
+					lenLineAct -= 22; // Remember that we skipped 22 bytes
+					continue;
+				} else if (nCellsSkipped) { // Write that we skipped cells
+				                            // before writting the new bytes
+					MEMCPY(start, SKIP, 6);
+					MEMCPY(start + 2, NUM_TO_CHAR_LUT_3[nCellsSkipped], 3);
+					start += 6;
+					lenLineAct += 6;
+					nCellsSkipped = 0;
+				}
+				MEMCPY(start, COLOR, 19);
+				// Write RGB (r at 17..19, g at 21..23, b at 25..27)
+				MEMCPY(start + 7,  NUM_TO_CHAR_LUT_3[cell[0][0]], 3);
+				MEMCPY(start + 11, NUM_TO_CHAR_LUT_3[cell[0][1]], 3);
+				MEMCPY(start + 15, NUM_TO_CHAR_LUT_3[cell[0][2]], 3);
+				// Write the char
+				MEMCPY(start + 19, cell[1], 3);
+				start += 22;
+			}
+
+			write(1, line, lenLineAct);
+		}
+
+		MEMSET(framebuf, 0, BUFFER_SIZE * 6);
 	}
 };
+
+Pipe::Pipe(Pipes *p) :
+		parent(p),
+		headX(rand() % parent->terminalWidth),
+		headY(rand() % parent->terminalHeight),
+		direction(rand() & 0b11)
+{
+	const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF) * 3;
+	rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
+}
+
+void Pipe::move()
+{
+	// The logic is around 4 tasks:
+	// - select the correct symbol to print
+	// - change the direction randomly
+	// - go in this direction
+	// - append the char pos to the list so it can be modified later
+
+	char symb[4] = "+";
+
+	// Change direction
+	// If the movement is horizontal, the chances to change dir are divided
+	// by 2 because the format of a monospace char is 2:1
+	uint8_t randN = rand() & 0xFF;
+	// If direction is odd the mov is horizontal
+	// so we multiply rot proba by 2
+	uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
+	if (randN <= compProb) { // direction move CW
+		static constexpr uint8_t DIR_LUT[] = {6, 9, 15, 12};
+		MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
+		/* Same as
+		switch (direction) {
+		case 0:memcpy(symb,&SYMBOLS[charId[index]=2*3],3);break; // South->East
+		case 1:memcpy(symb,&SYMBOLS[charId[index]=3*3],3);break; // West ->South
+		case 2:memcpy(symb,&SYMBOLS[charId[index]=5*3],3);break; // North->West
+		case 3:memcpy(symb,&SYMBOLS[charId[index]=4*3],3);break; // East ->North
+		default: fprintf(stderr, "Direction error");      break;
+		}*/
+		++direction &= 0b11;
+	} else if (randN >= 0xFF - compProb) { // direction move CCW
+		static constexpr uint8_t DIR_LUT[] = {9, 15, 12, 6};
+		MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
+		/* Same as
+		switch (direction) {
+		case 0:memcpy(symb,&SYMBOLS[charId[index]=3*3],3);break; // South->West
+		case 1:memcpy(symb,&SYMBOLS[charId[index]=5*3],3);break; // West ->North
+		case 2:memcpy(symb,&SYMBOLS[charId[index]=4*3],3);break; // North->East
+		case 3:memcpy(symb,&SYMBOLS[charId[index]=2*3],3);break; // East ->South
+		default: fprintf(stderr, "Direction error");      break;
+		}*/
+		(direction += 3) &= 0b11;
+	} else {
+		MEMCPY(symb, &SYMBOLS[charId[index] = 3*(direction&1)], 3);
+	}
+
+	pipePos[index * 2] = headX;
+	pipePos[index * 2 + 1] = headY;
+	index = (index + 1) % SHADES;
+
+	// For each dir, + of - in the correct direction
+	// then % to stay in the terminal
+	switch (direction) {
+	case 0: // North
+		(headY += parent->terminalHeight-1) %= parent->terminalHeight;
+		break;
+	case 2: // South
+		++headY %= parent->terminalHeight;
+		break;
+	case 3: // West
+		(headX += parent->terminalWidth-1) %= parent->terminalWidth;
+		break;
+	case 1: // East
+		++headX %= parent->terminalWidth;
+		break;
+	default: [[unlikely]]
+		fprintf(stderr, "Direction error\n");
+		break;
+	}
+}
+
+// Local index because its the priority:
+// lowers (first drawn/oldest) to higher (last drawn/newest)
+// localIndex=0: oldest, localIndex=SHADES-1: newest
+void Pipe::reprint(uint_fast8_t localIndex)
+{
+	uint_fast8_t idx = (index + localIndex) % SHADES;
+	// localIndex directly indexes decay table
+	uint8_t decay = DECAY_LUT[localIndex];
+	uint8_t invDecay = 255 - decay;
+	uint8_t newRgb[3] = {
+		(uint8_t)(((rgb[0]*decay)>>8) + ((parent->bgRgb[0]*invDecay)>>8)),
+		(uint8_t)(((rgb[1]*decay)>>8) + ((parent->bgRgb[1]*invDecay)>>8)),
+		(uint8_t)(((rgb[2]*decay)>>8) + ((parent->bgRgb[2]*invDecay)>>8))
+	};
+	uint16_t posX = pipePos[idx * 2];
+	if (!posX) return;
+	parent->write_to_buf(newRgb, &SYMBOLS[charId[idx]], posX, pipePos[idx*2+1]);
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -444,6 +480,10 @@ int main()
 
 	auto next = clock::now();
 
+	#ifdef DEBUG
+	fprintf(stderr, "\nDebug mode enabled\n");
+	#endif
+
 	// Set bold and hide cursor
 	write(1, "\033[1m\033[?25l", 11);
 
@@ -455,8 +495,7 @@ int main()
 		auto frame_start = clock::now();
 		#endif
 		pipes.next_frame();
-		write_to_buf("\033[0;0H", 6);
-		flush_buf();
+		pipes.flush_buf();
 		#ifdef DEBUG
 		auto frame_end = clock::now();
 		
@@ -467,8 +506,9 @@ int main()
 		int len = snprintf(debug_buf, sizeof(debug_buf),
 			"\033[1;70H\033[38;2;255;255;255m%5ld µs / 50'000µs",
 			render_us);
-		if (len > 0) write_to_buf(debug_buf, len);
-		flush_buf();
+		if (len > 0)
+			write(1, debug_buf, len);
+		pipes.flush_buf();
 		#endif
 
 		std::this_thread::sleep_until(next);
