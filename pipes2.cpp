@@ -1,23 +1,19 @@
 // g++ pipes2.cpp -o pipes2 -Wall -Wextra -fuse-ld=lld -Wshadow -g -fsanitize=address,undefined -O3 -std=c++20
-// I should put an intro
+// I should put an intro but test it to understand what it is
 
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <array>
 #include <cstdlib>
 #include <cstdio>
-#include <cstdarg>
 #include <cstdint>
-#include <array>
 #include <cstring>
-#include <unistd.h>
 #include <cassert>
 #include <cmath>
+#include <unistd.h>
 
 #define SHADES 116 // Change this if you change the multiplier for the shading
-#ifdef DO_SHADES
-#	define DO_BOUNCE // (comment to disable)
-#endif
 #define DEBUG // (comment to disable)
 // You might want to use with this option:
 // errout=$(mktemp) && ./pipes2 2> $errout ; printf "\033[H\033[0m" ; cat $errout
@@ -25,9 +21,12 @@
 #define PIPE_PER_CHUNK 147 // One chunk is 64*64
                            // (chunk means nothing in the logic)
 #define MAX_TERM_WIDTH 1000 // If you change this you will need to change
-                            // the LUT and the wirte function
-#define MEMCPY __builtin_memcpy // You can use memcpy if you have bugs
+                            // the LUT and the write function
+
+#define MEMCPY __builtin_memcpy // You may use memcpy if you have bugs
 #define MEMSET __builtin_memset //             memset
+#define MEMCMP __builtin_memcmp //             memcmp
+#define RAND    rand
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -261,7 +260,7 @@ public:
 	int terminalWidth = 0;
 	std::array<uint8_t, 3> bgRgb;
 	size_t BUFFER_SIZE = 0;
-	uint8_t (*framebuf)[2][3] = nullptr; // [terminalWidth*y+x][set1/2][utf8 or r/g/b]
+	uint8_t (*framebuf)[2][3] = nullptr; // [terminalWidth*y+x][set1/2][r/g/b or utf8]
 
 	Pipes(std::array<uint8_t, 3> bg = {0}):
 		bgRgb(bg)
@@ -288,6 +287,7 @@ public:
 	{
 		for (auto &pipe : pipes)
 			pipe.move();
+		MEMSET(framebuf, 0, BUFFER_SIZE * 6);
 		for (uint_fast8_t i = 0; i < SHADES; i++)
 			for (auto &pipe : pipes)
 				pipe.reprint(i);
@@ -361,70 +361,29 @@ public:
 
 			write(1, line, lenLineAct);
 		}
-
-		MEMSET(framebuf, 0, BUFFER_SIZE * 6);
 	}
 };
 
 Pipe::Pipe(Pipes *p) :
 		parent(p),
-		headX(rand() % parent->terminalWidth),
-		headY(rand() % parent->terminalHeight),
-		direction(rand() & 0b11)
+		headX(RAND() % parent->terminalWidth),
+		headY(RAND() % parent->terminalHeight),
+		direction(RAND() & 0b11)
 {
-	const uint8_t *val = HUE_LUT.data() + (rand() & 0xFF) * 3;
+	const uint8_t *val = HUE_LUT.data() + (RAND() & 0xFF) * 3;
 	rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
 }
 
 void Pipe::move()
 {
-	// The logic is around 4 tasks:
+	// The logic is around 5 tasks:
 	// - select the correct symbol to print
 	// - change the direction randomly
 	// - go in this direction
 	// - append the char pos to the list so it can be modified later
 
-	char symb[4] = "+";
 
-	// Change direction
-	// If the movement is horizontal, the chances to change dir are divided
-	// by 2 because the format of a monospace char is 2:1
-	uint8_t randN = rand() & 0xFF;
-	// If direction is odd the mov is horizontal
-	// so we multiply rot proba by 2
-	uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
-	if (randN <= compProb) { // direction move CW
-		static constexpr uint8_t DIR_LUT[] = {6, 9, 15, 12};
-		MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
-		/* Same as
-		switch (direction) {
-		case 0:memcpy(symb,&SYMBOLS[charId[index]=2*3],3);break; // South->East
-		case 1:memcpy(symb,&SYMBOLS[charId[index]=3*3],3);break; // West ->South
-		case 2:memcpy(symb,&SYMBOLS[charId[index]=5*3],3);break; // North->West
-		case 3:memcpy(symb,&SYMBOLS[charId[index]=4*3],3);break; // East ->North
-		default: fprintf(stderr, "Direction error");      break;
-		}*/
-		++direction &= 0b11;
-	} else if (randN >= 0xFF - compProb) { // direction move CCW
-		static constexpr uint8_t DIR_LUT[] = {9, 15, 12, 6};
-		MEMCPY(symb, &SYMBOLS[charId[index] = DIR_LUT[direction]], 3);
-		/* Same as
-		switch (direction) {
-		case 0:memcpy(symb,&SYMBOLS[charId[index]=3*3],3);break; // South->West
-		case 1:memcpy(symb,&SYMBOLS[charId[index]=5*3],3);break; // West ->North
-		case 2:memcpy(symb,&SYMBOLS[charId[index]=4*3],3);break; // North->East
-		case 3:memcpy(symb,&SYMBOLS[charId[index]=2*3],3);break; // East ->South
-		default: fprintf(stderr, "Direction error");      break;
-		}*/
-		(direction += 3) &= 0b11;
-	} else {
-		MEMCPY(symb, &SYMBOLS[charId[index] = 3*(direction&1)], 3);
-	}
-
-	pipePos[index * 2] = headX;
-	pipePos[index * 2 + 1] = headY;
-	index = (index + 1) % SHADES;
-
+	///----- HEAD PLACEMENT -------------------------------------------------///
 	// For each dir, + of - in the correct direction
 	// then % to stay in the terminal
 	switch (direction) {
@@ -444,6 +403,84 @@ void Pipe::move()
 		fprintf(stderr, "Direction error\n");
 		break;
 	}
+
+	///----- Change direction -----------------------------------------------///
+	// For the next frame
+
+	// Check if the pipe can turn or if it will overlap an other pipe
+	// (only crossing allowed)
+	// Logic is simple: if you are on a pipe you cant turn
+	// you must go forward
+	// this might cause issues:
+	//         ||
+	// ========>`----2
+	//         |
+	//         1
+	// In that case, the new pipe (===>) will overlap the 2nd pipe
+	uint8_t (*cell)[3] = parent->framebuf[parent->terminalWidth*headY+headX];
+	static constexpr uint8_t DIR_CW_LUT[] = {6, 9, 15, 12};
+	static constexpr uint8_t DIR_CCW_LUT[] = {9, 15, 12, 6};
+	if (!(cell[0][0] || cell[0][1] || cell[0][2]))
+	{
+		// If the movement is horizontal, the chances to change dir are divided
+		// by 2 because the format of a monospace char is 2:1
+		uint8_t randN = RAND() & 0xFF;
+		// If direction is odd the mov is horizontal
+		// so we multiply rot proba by 2
+		uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
+		if (randN <= compProb) { // direction move CW
+			charId[index] = DIR_CW_LUT[direction];
+			++direction &= 0b11;
+		} else if (randN >= 0xFF - compProb) { // direction move CCW
+			charId[index] = DIR_CCW_LUT[direction];
+			(direction += 3) &= 0b11;
+		} else {
+			/* FIXME
+			// Avoid going on a corner pipe
+			uint16_t x = headX, y = headY;
+			switch (direction) { // It will still be able to go on corners
+			                     // but less frequently (only on turns)
+			case 0: (y += parent->terminalHeight-1) %= parent->terminalHeight; break; // North
+			case 2: ++y %= parent->terminalHeight; break; // South
+			case 3: (x += parent->terminalWidth-1) %= parent->terminalWidth; break; // West
+			case 1: ++x %= parent->terminalWidth; break; // East
+			default: [[unlikely]]
+				fprintf(stderr, "Direction error\n");
+				break;
+			}
+			// Check if it's a straight pipe
+			if (MEMCMP(&SYMBOLS[3*1], (const char*)parent->framebuf[parent->terminalWidth*y+x][1], 3)
+			 || MEMCMP(&SYMBOLS[3*0], (const char*)parent->framebuf[parent->terminalWidth*y+x][1], 3)) {
+				charId[index] = 3*(direction&1);
+			} else {
+				if (RAND() & 1) { // direction move CW
+					charId[index] = DIR_CW_LUT[direction];
+					++direction &= 0b11;
+				} else { // direction move CCW
+					charId[index] = DIR_CCW_LUT[direction];
+					(direction += 3) &= 0b11;
+				}
+			}*/
+			charId[index] = 3*(direction&1);
+		}
+	} else if (!MEMCMP(&SYMBOLS[3*(direction&1)], (const char*)cell[1], 3)) {
+		// When already on a pipe
+		// There is no question, you WILL turn NOW
+		if (RAND() & 1) { // direction move CW
+			charId[index] = DIR_CW_LUT[direction];
+			++direction &= 0b11;
+		} else { // direction move CCW
+			charId[index] = DIR_CCW_LUT[direction];
+			(direction += 3) &= 0b11;
+		}
+	} else {
+		charId[index] = 3*(direction&1);
+	}
+
+	///----- MOVEMENT -------------------------------------------------------///
+	pipePos[index * 2] = headX;
+	pipePos[index * 2 + 1] = headY;
+	index = (index + 1) % SHADES;
 }
 
 // Local index because its the priority:
@@ -508,7 +545,6 @@ int main()
 			render_us);
 		if (len > 0)
 			write(1, debug_buf, len);
-		pipes.flush_buf();
 		#endif
 
 		std::this_thread::sleep_until(next);
