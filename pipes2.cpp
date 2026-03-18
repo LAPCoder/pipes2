@@ -1,4 +1,6 @@
-// g++ pipes2.cpp -o pipes2 -Wall -Wextra -fuse-ld=lld -Wshadow -g -fsanitize=address,undefined -O3 -std=c++20
+// g++ pipes2.cpp -o pipes2 -Wall -Wextra -Wshadow -fuse-ld=lld -g -fsanitize=address,undefined -O3 -std=c++20 -DDEBUG
+// Or to be even more agressive:
+// g++ pipes2.cpp -o pipes2 -Wall -Wextra -Wshadow -fuse-ld=lld -O3 -std=c++20 -Ofast -march=native -flto -funroll-loops -ffast-math -fprofile-use
 // I should put an intro but test it to understand what it is
 
 #include <chrono>
@@ -14,9 +16,14 @@
 #include <unistd.h>
 
 #define SHADES 116 // Change this if you change the multiplier for the shading
-#define DEBUG // (comment to disable)
+
 // You might want to use with this option:
 // errout=$(mktemp) && ./pipes2 2> $errout ; printf "\033[H\033[0m" ; cat $errout
+//#define DEBUG // (comment to disable)
+
+// You might want to use this command instead
+// g++ <args> -DPROFILER -fprofile-generate
+//#define PROFILER // (comment to disable)
 
 #define PIPE_PER_CHUNK 147 // One chunk is 64*64
                            // (chunk means nothing in the logic)
@@ -26,7 +33,8 @@
 #define MEMCPY __builtin_memcpy // You may use memcpy if you have bugs
 #define MEMSET __builtin_memset //             memset
 #define MEMCMP __builtin_memcmp //             memcmp
-#define RAND    rand
+#define RAND   fast_rand        //             rand
+#define SRAND  fast_srand       //             srand
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -45,6 +53,49 @@ static constexpr char SYMBOLS[3*6+1] = "│─╭╮╰╯"; // UTF8: 3 bytes ea
 // Add \0 if you need
 
 ////////////////////////////////////////////////////////////////////////////////
+
+template <typename T> concept Signed   = std::is_signed_v<T>;
+template <typename T> concept Unsigned = std::is_unsigned_v<T>;
+
+// Assume var is already in the limits
+// Modify var and returns it
+template<typename T, typename U>
+static inline constexpr T &incr_limit(T &var, const U limit)
+{
+	if (++var >= limit) var -= limit;
+	return var;
+}
+
+template<Signed T, typename U>
+static inline constexpr T &decr_limit(T &var, const U limit)
+{
+	if (--var < 0) var += limit;
+	return var;
+}
+
+template<Unsigned T, typename U>
+static inline constexpr T &decr_limit(T &var, const U limit)
+{
+	var += limit - 1;
+	if (var >= limit) var -= limit;
+	return var;
+}
+
+static unsigned int g_seed;
+
+// Used to seed the generator.
+inline void fast_srand(int seed)
+{
+	g_seed = seed;
+}
+
+// Compute a pseudorandom integer.
+// Output value in range [0, 32767]
+inline int fast_rand()
+{
+	g_seed = (214013*g_seed+2531011);
+	return (g_seed>>16)&0x7FFF;
+}
 
 // Thanks cross-platform compat...
 // (thanks ProjectPhysX)
@@ -108,7 +159,9 @@ std::array<uint8_t, 3> query_term_bg()
 	}
 	SetConsoleMode(hi, mi); SetConsoleMode(ho, mo);
 	CloseHandle(hi); CloseHandle(ho);
-
+	// Enable UTF-8 (required by the SYMBOLS)
+	SetConsoleCP(CP_UTF8);
+	SetConsoleOutputCP(CP_UTF8);
 
 #else // ── POSIX (Linux / macOS) ──────────────────────────────────────────────
 	int fd = open("/dev/tty", O_RDWR | O_NOCTTY);
@@ -174,6 +227,7 @@ consteval std::array<uint8_t,256 * 3> make_hue_LUT()
 	return lut;
 }
 
+// Slow but precise algo for compilation time only
 consteval std::size_t digits10(size_t v)
 {
 	std::size_t d = 1;
@@ -219,7 +273,7 @@ consteval std::array<uint8_t, SHADES> make_decay_lut()
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// L1 cache alignment (64-byte cache line) for hot lookup tables
+// L1 cache alignment (64-byte cache line) for lookup tables
 alignas(64) static constexpr std::array<uint8_t,256*3> HUE_LUT = make_hue_LUT();
 alignas(64) static constexpr auto DECAY_LUT = make_decay_lut();
 alignas(64) static constexpr auto NUM_TO_CHAR_LUT_3 = make_num_to_char_lut<999>();
@@ -238,7 +292,7 @@ public:
 	static constexpr uint8_t rotProba = 20; // out of 128
 	// Value is adjusted later
 
-	uint16_t pipePos[SHADES*2] = {0}; // Stores XY for each pipe already drawn.
+	uint16_t pipePos[SHADES*2]; // Stores XY for each pipe already drawn.
 	// 116 is the number of shades of the color (starting from 255) that i
 	// will get if i fo x * 250 / 255 after each frame
 	// so at frame 117 the first pixel will be black
@@ -258,11 +312,11 @@ private:
 public:
 	int terminalHeight = 0;
 	int terminalWidth = 0;
-	std::array<uint8_t, 3> bgRgb;
+	const std::array<uint8_t, 3> bgRgb;
 	size_t BUFFER_SIZE = 0;
 	uint8_t (*framebuf)[2][3] = nullptr; // [terminalWidth*y+x][set1/2][r/g/b or utf8]
 
-	Pipes(std::array<uint8_t, 3> bg = {0}):
+	Pipes(const std::array<uint8_t, 3> &bg = {0u}):
 		bgRgb(bg)
 	{
 		get_terminal_size(terminalWidth, terminalHeight);
@@ -271,7 +325,7 @@ public:
 		// Change the divider  to match your preferences
 		density = std::max(BUFFER_SIZE / PIPE_PER_CHUNK,(size_t)4);
 
-		framebuf = new uint8_t[BUFFER_SIZE][2][3]{0};
+		framebuf = new uint8_t[BUFFER_SIZE][2][3]{0u};
 		
 		for (unsigned i = 0; i < density; i++)
 			pipes.emplace_back(Pipe(this));
@@ -279,7 +333,7 @@ public:
 
 	~Pipes()
 	{
-		delete framebuf;
+		delete[] framebuf;
 	}
 
 	// Next frame
@@ -304,7 +358,10 @@ public:
 		if (pos >= BUFFER_SIZE) [[unlikely]]
 		{
 			#ifdef DEBUG
-			fprintf(stderr, "Error: bad buffer pos (overflow)\n");
+			fprintf(
+				stderr,
+				"Error: bad buffer pos (overflow): Max: %llu, recieved %llu\n",
+				BUFFER_SIZE, pos);
 			#endif
 			return;
 		}
@@ -370,6 +427,7 @@ Pipe::Pipe(Pipes *p) :
 		headY(RAND() % parent->terminalHeight),
 		direction(RAND() & 0b11)
 {
+	MEMSET(pipePos, UINT16_MAX, sizeof(pipePos));
 	const uint8_t *val = HUE_LUT.data() + (RAND() & 0xFF) * 3;
 	rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
 }
@@ -387,18 +445,10 @@ void Pipe::move()
 	// For each dir, + of - in the correct direction
 	// then % to stay in the terminal
 	switch (direction) {
-	case 0: // North
-		(headY += parent->terminalHeight-1) %= parent->terminalHeight;
-		break;
-	case 2: // South
-		++headY %= parent->terminalHeight;
-		break;
-	case 3: // West
-		(headX += parent->terminalWidth-1) %= parent->terminalWidth;
-		break;
-	case 1: // East
-		++headX %= parent->terminalWidth;
-		break;
+	case 0: decr_limit(headY, parent->terminalHeight); break; // North
+	case 2: incr_limit(headY, parent->terminalHeight); break; // South
+	case 3: decr_limit(headX, parent->terminalWidth); break; // West
+	case 1: incr_limit(headX, parent->terminalWidth); break; // East
 	default: [[unlikely]]
 		fprintf(stderr, "Direction error\n");
 		break;
@@ -426,7 +476,7 @@ void Pipe::move()
 		// by 2 because the format of a monospace char is 2:1
 		uint8_t randN = RAND() & 0xFF;
 		// If direction is odd the mov is horizontal
-		// so we multiply rot proba by 2
+		// so we divide rot proba by 2
 		uint8_t compProb = (rotProba << ((~direction)&1)) - 1;
 		if (randN <= compProb) { // direction move CW
 			charId[index] = DIR_CW_LUT[direction];
@@ -435,24 +485,26 @@ void Pipe::move()
 			charId[index] = DIR_CCW_LUT[direction];
 			(direction += 3) &= 0b11;
 		} else {
-			/* FIXME
+			// Go forward
 			// Avoid going on a corner pipe
 			uint16_t x = headX, y = headY;
 			switch (direction) { // It will still be able to go on corners
 			                     // but less frequently (only on turns)
-			case 0: (y += parent->terminalHeight-1) %= parent->terminalHeight; break; // North
-			case 2: ++y %= parent->terminalHeight; break; // South
-			case 3: (x += parent->terminalWidth-1) %= parent->terminalWidth; break; // West
-			case 1: ++x %= parent->terminalWidth; break; // East
+			case 0: decr_limit(y, parent->terminalHeight); break; // North
+			case 2: incr_limit(y, parent->terminalHeight); break; // South
+			case 3: decr_limit(x, parent->terminalWidth); break; // West
+			case 1: incr_limit(x, parent->terminalWidth); break; // East
 			default: [[unlikely]]
 				fprintf(stderr, "Direction error\n");
 				break;
 			}
-			// Check if it's a straight pipe
-			if (MEMCMP(&SYMBOLS[3*1], (const char*)parent->framebuf[parent->terminalWidth*y+x][1], 3)
-			 || MEMCMP(&SYMBOLS[3*0], (const char*)parent->framebuf[parent->terminalWidth*y+x][1], 3)) {
-				charId[index] = 3*(direction&1);
-			} else {
+			// Check if it's a straight pipe or nothing
+			const char *nextCell =
+				(const char*)parent->framebuf[parent->terminalWidth*y+x][1];
+			static constexpr char voidCell[3] = {0u,0u,0u};
+			if (MEMCMP(&SYMBOLS[3*1], nextCell, 3)
+			 && MEMCMP(&SYMBOLS[3*0], nextCell, 3)
+			 && MEMCMP(voidCell,      nextCell, 3)) {
 				if (RAND() & 1) { // direction move CW
 					charId[index] = DIR_CW_LUT[direction];
 					++direction &= 0b11;
@@ -460,8 +512,9 @@ void Pipe::move()
 					charId[index] = DIR_CCW_LUT[direction];
 					(direction += 3) &= 0b11;
 				}
-			}*/
-			charId[index] = 3*(direction&1);
+			} else {
+				charId[index] = 3*(direction&1);
+			}
 		}
 	} else if (!MEMCMP(&SYMBOLS[3*(direction&1)], (const char*)cell[1], 3)) {
 		// When already on a pipe
@@ -474,46 +527,48 @@ void Pipe::move()
 			(direction += 3) &= 0b11;
 		}
 	} else {
+		// It is on a pipe, go forward
 		charId[index] = 3*(direction&1);
 	}
 
 	///----- MOVEMENT -------------------------------------------------------///
 	pipePos[index * 2] = headX;
 	pipePos[index * 2 + 1] = headY;
-	index = (index + 1) % SHADES;
+	incr_limit(index, SHADES);
 }
 
 // Local index because its the priority:
 // lowers (first drawn/oldest) to higher (last drawn/newest)
 // localIndex=0: oldest, localIndex=SHADES-1: newest
-void Pipe::reprint(uint_fast8_t localIndex)
+void Pipe::reprint(const uint_fast8_t localIndex)
 {
 	uint_fast8_t idx = (index + localIndex) % SHADES;
 	// localIndex directly indexes decay table
 	uint8_t decay = DECAY_LUT[localIndex];
 	uint8_t invDecay = 255 - decay;
 	uint8_t newRgb[3] = {
-		(uint8_t)(((rgb[0]*decay)>>8) + ((parent->bgRgb[0]*invDecay)>>8)),
-		(uint8_t)(((rgb[1]*decay)>>8) + ((parent->bgRgb[1]*invDecay)>>8)),
-		(uint8_t)(((rgb[2]*decay)>>8) + ((parent->bgRgb[2]*invDecay)>>8))
+		(uint8_t)(((rgb[0]*decay+128)>>8)+((parent->bgRgb[0]*invDecay+128)>>8)),
+		(uint8_t)(((rgb[1]*decay+128)>>8)+((parent->bgRgb[1]*invDecay+128)>>8)),
+		(uint8_t)(((rgb[2]*decay+128)>>8)+((parent->bgRgb[2]*invDecay+128)>>8))
 	};
 	uint16_t posX = pipePos[idx * 2];
-	if (!posX) return;
+	if (posX == UINT16_MAX) return;
 	parent->write_to_buf(newRgb, &SYMBOLS[charId[idx]], posX, pipePos[idx*2+1]);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
+__attribute__((no_instrument_function, no_profile_instrument_function))
 int main()
 {
-	srand(time(NULL));
+	SRAND(time(NULL));
 
 	// Startup time is due to this
 	std::array<uint8_t, 3> bgRgb = query_term_bg();
 
 	Pipes pipes(bgRgb);
 	using clock = std::chrono::steady_clock;
-    constexpr auto frame_time = std::chrono::milliseconds(50); // 20 FPS
+	constexpr auto frame_time = std::chrono::milliseconds(50); // 20 FPS
 
 	auto next = clock::now();
 
@@ -524,7 +579,12 @@ int main()
 	// Set bold and hide cursor
 	write(1, "\033[1m\033[?25l", 11);
 
+	#ifdef PROFILER
+	int i = 1000; // The number of execution for the profiler
+	while (i--) {
+	#else
 	while (true) {
+	#endif
 		next += frame_time;
 
 		#ifdef DEBUG
@@ -541,13 +601,15 @@ int main()
 			frame_end - frame_start).count();
 		char debug_buf[64];
 		int len = snprintf(debug_buf, sizeof(debug_buf),
-			"\033[1;70H\033[38;2;255;255;255m%5ld µs / 50'000µs",
-			render_us);
+			"\033[1;70H\033[38;2;255;255;255m%5lld µs / 50'000µs",
+			(long long)render_us);
 		if (len > 0)
 			write(1, debug_buf, len);
 		#endif
 
+		#ifndef PROFILER
 		std::this_thread::sleep_until(next);
+		#endif
 	}
 	return 0;
 }
