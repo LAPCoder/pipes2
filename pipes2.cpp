@@ -1,6 +1,7 @@
 // g++ pipes2.cpp -o pipes2 -Wall -Wextra -Wshadow -fuse-ld=lld -g -fsanitize=address,undefined -O3 -std=c++20 -DDEBUG
 // Or to be even more agressive:
-// g++ pipes2.cpp -o pipes2 -Wall -Wextra -Wshadow -fuse-ld=lld -O3 -std=c++20 -Ofast -march=native -flto -funroll-loops -ffast-math -fprofile-use
+// g++ pipes2.cpp -o pipes2 -Wall -Wextra -Wshadow -fuse-ld=lld -O3 -std=c++20 -Ofast -march=native -funroll-loops -ffast-math -fprofile-use
+
 // I should put an intro but test it to understand what it is
 
 #include <chrono>
@@ -210,10 +211,8 @@ consteval std::array<uint8_t,256 * 3> make_hue_LUT()
 
 	for (uint_fast16_t i = 0; i < 256; i++) {
 		size_t idx = i * 3;
-		uint8_t sector = i / 43;
-		uint8_t offset = i - sector * 43;
-
-		uint8_t t = ((uint16_t)offset * 255 + 21) / 43;
+		uint8_t sector = (uint8_t)((i * 6) >> 8);
+		uint8_t t = (uint8_t)((i * 6) & 0xFF);
 
 		switch (sector)	{
 			case 0: lut[idx]=255;  lut[idx+1]=t;    lut[idx+2]=0;    break;
@@ -288,7 +287,7 @@ public:
 	uint16_t headX = 0;
 	uint16_t headY = 0;
 	uint8_t direction; // 0 north, 1 east, 2 south, 3 west
-	uint8_t rgb[3] = {0};
+	uint8_t hue = 0;
 	static constexpr uint8_t rotProba = 20; // out of 128
 	// Value is adjusted later
 
@@ -361,7 +360,7 @@ public:
 			fprintf(
 				stderr,
 				"Error: bad buffer pos (overflow): Max: %llu, recieved %llu\n",
-				BUFFER_SIZE, pos);
+				(unsigned long long)BUFFER_SIZE, (unsigned long long)pos);
 			#endif
 			return;
 		}
@@ -428,8 +427,7 @@ Pipe::Pipe(Pipes *p) :
 		direction(RAND() & 0b11)
 {
 	MEMSET(pipePos, UINT16_MAX, sizeof(pipePos));
-	const uint8_t *val = HUE_LUT.data() + (RAND() & 0xFF) * 3;
-	rgb[0] = *val, rgb[1] = *++val, rgb[2] = *++val;
+	hue = RAND() & 0xFF;
 }
 
 void Pipe::move()
@@ -535,6 +533,8 @@ void Pipe::move()
 	pipePos[index * 2] = headX;
 	pipePos[index * 2 + 1] = headY;
 	incr_limit(index, SHADES);
+
+	incr_limit(hue, 256);
 }
 
 // Local index because its the priority:
@@ -546,6 +546,8 @@ void Pipe::reprint(const uint_fast8_t localIndex)
 	// localIndex directly indexes decay table
 	uint8_t decay = DECAY_LUT[localIndex];
 	uint8_t invDecay = 255 - decay;
+	uint8_t rgb[3];
+	MEMCPY(rgb, &HUE_LUT[((hue+localIndex)&0xFF)*3], 3);
 	uint8_t newRgb[3] = {
 		(uint8_t)(((rgb[0]*decay+128)>>8)+((parent->bgRgb[0]*invDecay+128)>>8)),
 		(uint8_t)(((rgb[1]*decay+128)>>8)+((parent->bgRgb[1]*invDecay+128)>>8)),
@@ -558,7 +560,7 @@ void Pipe::reprint(const uint_fast8_t localIndex)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-__attribute__((no_instrument_function, no_profile_instrument_function))
+__attribute__((used, no_instrument_function, no_profile_instrument_function))
 int main()
 {
 	SRAND(time(NULL));
