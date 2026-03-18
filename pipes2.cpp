@@ -364,7 +364,7 @@ public:
 			#endif
 			return;
 		}
-		MEMCPY(framebuf[pos][0], rgb, 3);
+		MEMCPY(framebuf[pos][0], rgb,  3);
 		MEMCPY(framebuf[pos][1], utf8, 3);
 	}
 
@@ -378,7 +378,8 @@ public:
 		static char line[MAX_TERM_WIDTH*22 + 8];
 		static constexpr char MV[9] = "\033[000;0H"; // 8+\0 but we dont need \0
 		static constexpr char COLOR[20] = "\033[38;2;000;000;000m"; // 19+\0
-		static constexpr char SKIP[7] = "\033[000C"; // 6+\0
+		static constexpr char SKIP1[5] = "\033[0C";   // 4+\0
+		static constexpr char SKIP3[7] = "\033[000C"; // 6+\0
 		for (uint_fast16_t y = 0; y < (uint_fast16_t)terminalHeight; y++)
 		{
 			size_t lenLineAct = lineLen;
@@ -399,10 +400,17 @@ public:
 					continue;
 				} else if (nCellsSkipped) { // Write that we skipped cells
 				                            // before writting the new bytes
-					MEMCPY(start, SKIP, 6);
-					MEMCPY(start + 2, NUM_TO_CHAR_LUT_3[nCellsSkipped], 3);
-					start += 6;
-					lenLineAct += 6;
+					if (nCellsSkipped < 10) {
+						MEMCPY(start, SKIP1, 4);
+						start[2] = nCellsSkipped + '0';
+						start += 4;
+						lenLineAct += 4;
+					} else {
+						MEMCPY(start, SKIP3, 6);
+						MEMCPY(start + 2, NUM_TO_CHAR_LUT_3[nCellsSkipped], 3);
+						start += 6;
+						lenLineAct += 6;
+					}
 					nCellsSkipped = 0;
 				}
 				MEMCPY(start, COLOR, 19);
@@ -438,15 +446,17 @@ void Pipe::move()
 	// - go in this direction
 	// - append the char pos to the list so it can be modified later
 
+	const int h = parent->terminalHeight, w = parent->terminalWidth;
+
 
 	///----- HEAD PLACEMENT -------------------------------------------------///
 	// For each dir, + of - in the correct direction
 	// then % to stay in the terminal
 	switch (direction) {
-	case 0: decr_limit(headY, parent->terminalHeight); break; // North
-	case 2: incr_limit(headY, parent->terminalHeight); break; // South
-	case 3: decr_limit(headX, parent->terminalWidth); break; // West
-	case 1: incr_limit(headX, parent->terminalWidth); break; // East
+	case 0: decr_limit(headY, h); break; // North
+	case 2: incr_limit(headY, h); break; // South
+	case 3: decr_limit(headX, w); break; // West
+	case 1: incr_limit(headX, w); break; // East
 	default: [[unlikely]]
 		fprintf(stderr, "Direction error\n");
 		break;
@@ -465,7 +475,7 @@ void Pipe::move()
 	//         |
 	//         1
 	// In that case, the new pipe (===>) will overlap the 2nd pipe
-	uint8_t (*cell)[3] = parent->framebuf[parent->terminalWidth*headY+headX];
+	uint8_t (*cell)[3] = parent->framebuf[w*headY+headX];
 	static constexpr uint8_t DIR_CW_LUT[] = {6, 9, 15, 12};
 	static constexpr uint8_t DIR_CCW_LUT[] = {9, 15, 12, 6};
 	if (!(cell[0][0] || cell[0][1] || cell[0][2]))
@@ -488,17 +498,17 @@ void Pipe::move()
 			uint16_t x = headX, y = headY;
 			switch (direction) { // It will still be able to go on corners
 			                     // but less frequently (only on turns)
-			case 0: decr_limit(y, parent->terminalHeight); break; // North
-			case 2: incr_limit(y, parent->terminalHeight); break; // South
-			case 3: decr_limit(x, parent->terminalWidth); break; // West
-			case 1: incr_limit(x, parent->terminalWidth); break; // East
+			case 0: decr_limit(y, h); break; // North
+			case 2: incr_limit(y, h); break; // South
+			case 3: decr_limit(x, w); break; // West
+			case 1: incr_limit(x, w); break; // East
 			default: [[unlikely]]
 				fprintf(stderr, "Direction error\n");
 				break;
 			}
 			// Check if it's a straight pipe or nothing
 			const char *nextCell =
-				(const char*)parent->framebuf[parent->terminalWidth*y+x][1];
+				(const char*)parent->framebuf[w*y+x][1];
 			static constexpr char voidCell[3] = {0u,0u,0u};
 			if (MEMCMP(&SYMBOLS[3*1], nextCell, 3)
 			 && MEMCMP(&SYMBOLS[3*0], nextCell, 3)
@@ -594,17 +604,22 @@ int main()
 		auto frame_start = clock::now();
 		#endif
 		pipes.next_frame();
+		#ifdef DEBUG
+		auto frame_gen_finished = clock::now();
+		#endif
 		pipes.flush_buf();
 		#ifdef DEBUG
 		auto frame_end = clock::now();
 		
 		// Debug: render time in top-right corner
+		auto gen_us = std::chrono::duration_cast<std::chrono::microseconds>(
+			frame_gen_finished - frame_start).count();
 		auto render_us = std::chrono::duration_cast<std::chrono::microseconds>(
 			frame_end - frame_start).count();
 		char debug_buf[64];
 		int len = snprintf(debug_buf, sizeof(debug_buf),
-			"\033[1;70H\033[38;2;255;255;255m%5lld µs / 50'000µs",
-			(long long)render_us);
+			"\033[1;70H\033[38;2;255;255;255m%5lld (%4lld) µs / 50'000µs",
+			 (long long)render_us, (long long)gen_us);
 		if (len > 0)
 			write(1, debug_buf, len);
 		#endif
