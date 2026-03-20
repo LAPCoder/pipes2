@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <unistd.h>
+#include <sys/uio.h>
 
 #define SHADES 116 // Change this if you change the multiplier for the shading
 
@@ -28,8 +29,8 @@
 
 #define PIPE_PER_CHUNK 147 // One chunk is 64*64
                            // (chunk means nothing in the logic)
-#define MAX_TERM_WIDTH 1000 // If you change this you will need to change
-                            // the LUT and the write function
+#define MAX_TERM_WIDTH  999 // If you change these you will need to change
+#define MAX_TERM_HEIGHT 999 // the LUT and the write function
 
 #define MEMCPY __builtin_memcpy // You may use memcpy if you have bugs
 #define MEMSET __builtin_memset //             memset
@@ -375,14 +376,17 @@ public:
 		// + the actual UTF-8 char (3 byte) so 19 + 3 = 22 bytes per char
 		// + the "\033[000;0H" (8 byte) to move to the correct pos
 		const size_t lineLen = terminalWidth*22 + 8;
-		static char line[MAX_TERM_WIDTH*22 + 8];
+		static char lines[MAX_TERM_HEIGHT][MAX_TERM_WIDTH*22 + 8];
 		static constexpr char MV[9] = "\033[000;0H"; // 8+\0 but we dont need \0
 		static constexpr char COLOR[20] = "\033[38;2;000;000;000m"; // 19+\0
 		static constexpr char SKIP1[5] = "\033[0C";   // 4+\0
 		static constexpr char SKIP3[7] = "\033[000C"; // 6+\0
+		static struct iovec iov[MAX_TERM_HEIGHT];
+
 		for (uint_fast16_t y = 0; y < (uint_fast16_t)terminalHeight; y++)
 		{
 			size_t lenLineAct = lineLen;
+			char *line = lines[y];
 			// Reset line
 			MEMSET(line, 0, lineLen);
 			// Init line
@@ -394,7 +398,12 @@ public:
 			{
 				uint8_t (*cell)[3] = framebuf[y*terminalWidth+x];
 				// Check if RGB is black + char is null
-				if (!(cell[0][0] || cell[0][1] || cell[0][2] || cell[1][0])) {
+				// Layout: 6 bytes, null = 6 0s. 1 byte is 2 hex, so 12 hexes
+				// But we dont need to check the whole utf8 to see if its null,
+				// just the first byte. So 4 bytes, 8 hexes. If rgbC == 0,
+				// rgb == 0 and utf8 == 0
+				uint32_t rgbC = *(uint32_t*)cell;
+				if (!(rgbC & 0xFFFFFF)) {
 					nCellsSkipped++;
 					lenLineAct -= 22; // Remember that we skipped 22 bytes
 					continue;
@@ -422,9 +431,12 @@ public:
 				MEMCPY(start + 19, cell[1], 3);
 				start += 22;
 			}
-
-			write(1, line, lenLineAct);
+			iov[y].iov_len = lenLineAct;
 		}
+		for (int y = 0; y < terminalHeight; y++) {
+			iov[y].iov_base = lines[y]; // pointer to your line
+		}
+		writev(1, iov, terminalHeight);
 	}
 };
 
@@ -478,7 +490,8 @@ void Pipe::move()
 	uint8_t (*cell)[3] = parent->framebuf[w*headY+headX];
 	static constexpr uint8_t DIR_CW_LUT[] = {6, 9, 15, 12};
 	static constexpr uint8_t DIR_CCW_LUT[] = {9, 15, 12, 6};
-	if (!(cell[0][0] || cell[0][1] || cell[0][2]))
+	uint32_t rgbC = *(uint32_t*)cell;
+	if (!(rgbC & 0xFFFFFF))
 	{
 		// If the movement is horizontal, the chances to change dir are divided
 		// by 2 because the format of a monospace char is 2:1
